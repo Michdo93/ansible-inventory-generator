@@ -1,201 +1,285 @@
 #!/usr/bin/env bash
-# Discover SSH hosts and create or update an Ansible INI inventory at hosts.new.
+# Ansible Inventory Generator - run on the Ansible control node.
+#
+# Single entry point for onboarding hosts:
+#   1. ensures an SSH key pair on the control node (generates ed25519 if missing),
+#   2. scans an IPv4 range for SSH,
+#   3. per host: logs in with the dedicated Ansible account via SSH key; if that is
+#      not possible yet, runs ssh-ansible-bootstrap-manager (creates the account,
+#      installs the public key, configures sudo/Administrators),
+#   4. writes an inventory WITHOUT plaintext passwords:
+#        $OUTPUT_DIR/hosts.ini, $OUTPUT_DIR/host_vars/<host>/vars.yml,
+#        $OUTPUT_DIR/host_vars/<host>/vault.yml  (ansible-vault encrypted become password),
+#        $OUTPUT_DIR/ansible.cfg
+#   5. optionally verifies every host with Ansible (become via Vault).
+#
+# Environment: OUTPUT_DIR (default ./inventory), VAULT_PASSWORD_FILE (default
+# ~/.ansible/vault_pass.txt), BOOTSTRAP_MANAGER_DIR, BM_KEY_FILE (SSH key to use).
 set -uo pipefail
 
-readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
 readonly HELPER="$SCRIPT_DIR/inventory-helper.py"
-readonly OUTPUT_FILE="${OUTPUT_FILE:-hosts.new}"
-readonly CONNECT_TIMEOUT=4
+readonly MANAGER_REPO=${MANAGER_REPO:-https://github.com/Michdo93/ssh-ansible-bootstrap-manager.git}
+OUTPUT_DIR=${OUTPUT_DIR:-./inventory}
+VAULT_PASSWORD_FILE=${VAULT_PASSWORD_FILE:-$HOME/.ansible/vault_pass.txt}
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
-ask_yes_no() {
-  local prompt=$1 default=$2 answer
-  while true; do
-    if [[ $default == y ]]; then read -r -p "$prompt [Y/n] " answer || return 1
-    else read -r -p "$prompt [y/N] " answer || return 1; fi
-    answer=${answer,,}
-    case "$answer" in y|yes) return 0;; n|no) return 1;; '') [[ $default == y ]] && return 0 || return 1;; *) printf 'Please answer y/yes or n/no.\n';; esac
-  done
-}
-ipv4_to_int() {
-  local a b c d
-  IFS=. read -r a b c d <<< "$1"
-  [[ "$a$b$c$d" =~ ^[0-9]+$ ]] || return 1
-  ((a<=255 && b<=255 && c<=255 && d<=255)) || return 1
-  printf '%u' "$(((a<<24)|(b<<16)|(c<<8)|d))"
-}
-int_to_ipv4() { local n=$1; printf '%d.%d.%d.%d' "$((n>>24&255))" "$((n>>16&255))" "$((n>>8&255))" "$((n&255))"; }
-valid_user() { [[ $1 =~ ^[A-Za-z0-9_.@+-]+[$]?$ ]]; }
-valid_group() { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]; }
 decode_b64() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+valid_group() { [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
 
-command -v ssh >/dev/null || die 'OpenSSH client (ssh) is required.'
-command -v sshpass >/dev/null || die "sshpass is required for password authentication."
-command -v timeout >/dev/null || die "The 'timeout' command is required (Linux or WSL)."
-command -v python3 >/dev/null || die 'Python 3 is required for safe inventory parsing and updates.'
+# ------------------------------------------------------ bootstrap manager ---
+find_manager() {
+  local d
+  for d in "${BOOTSTRAP_MANAGER_DIR:-}" "$SCRIPT_DIR/../ssh-ansible-bootstrap-manager" "$SCRIPT_DIR/vendor/ssh-ansible-bootstrap-manager"; do
+    [[ -n $d && -r $d/lib/bootstrap-lib.sh ]] && { MANAGER_DIR=$(cd -- "$d" && pwd); return 0; }
+  done
+  printf 'ssh-ansible-bootstrap-manager was not found next to this repository.\n'
+  command -v git >/dev/null 2>&1 || die "Install git or clone $MANAGER_REPO next to this repository."
+  read -r -p "Clone it into $SCRIPT_DIR/vendor now? [Y/n] " a || exit 1
+  [[ ${a,,} == n* ]] && die 'The bootstrap manager is required.'
+  git clone -q --depth 1 "$MANAGER_REPO" "$SCRIPT_DIR/vendor/ssh-ansible-bootstrap-manager" || die 'git clone failed.'
+  MANAGER_DIR=$SCRIPT_DIR/vendor/ssh-ansible-bootstrap-manager
+}
+find_manager
+# shellcheck source=/dev/null
+source "$MANAGER_DIR/lib/bootstrap-lib.sh"
+ask_yes_no() { bm_ask_yes_no "$@"; }
+
+command -v python3 >/dev/null || die 'Python 3 is required.'
+command -v ansible-vault >/dev/null || die 'ansible-vault was not found. Run this on the Ansible control node (e.g. sudo apt install ansible-core, or pipx install ansible-core).'
 [[ -r $HELPER ]] || die "Missing helper: $HELPER"
+bm_check_dependencies || exit 1
+bm_ensure_keypair || exit 1
 
-printf 'Create hosts.new from an existing inventory before scanning?\n'
-if ask_yes_no 'Copy and use an existing inventory as the starting point?' n; then
-  default_source=/etc/ansible/hosts
-  read -r -p "Source inventory path [$default_source]: " source_inventory || exit 0
-  source_inventory=${source_inventory:-$default_source}
-  [[ -r $source_inventory ]] || die "Cannot read source inventory: $source_inventory"
-else
-  source_inventory=
-fi
-
-if [[ -e $OUTPUT_FILE ]] && ! ask_yes_no "$OUTPUT_FILE already exists. Replace it with this run's starting inventory?" n; then
-  die 'Choose another OUTPUT_FILE path or move the existing output aside.'
-fi
+# ------------------------------------------------------------ vault password ---
 umask 077
-if [[ -n $source_inventory ]]; then cp -- "$source_inventory" "$OUTPUT_FILE" || die "Could not copy source inventory to $OUTPUT_FILE"
-else printf '# Generated by Ansible Inventory Generator. Review before use.\n' > "$OUTPUT_FILE" || die "Cannot create $OUTPUT_FILE"; fi
-chmod 600 "$OUTPUT_FILE" 2>/dev/null || true
+if [[ -s $VAULT_PASSWORD_FILE ]]; then
+  printf 'Using Vault password file: %s\n' "$VAULT_PASSWORD_FILE"
+  [[ $(stat -c %a "$VAULT_PASSWORD_FILE" 2>/dev/null) =~ ^[67]00$ ]] || chmod 600 "$VAULT_PASSWORD_FILE"
+  vault_file=$VAULT_PASSWORD_FILE store_vault_pw=true
+else
+  printf '\nAnsible Vault encrypts the account passwords used for sudo (Linux) and runas (Windows).\n'
+  if ask_yes_no "Store the Vault password in $VAULT_PASSWORD_FILE (0600) so Ansible can run unattended?" y; then
+    store_vault_pw=true
+    read -r -s -p 'New Vault password (empty = generate a random one): ' vpw; printf '\n'
+    if [[ -z $vpw ]]; then
+      vpw=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)
+      printf 'Generated a random Vault password. Back up %s - without it the vault cannot be decrypted.\n' "$VAULT_PASSWORD_FILE"
+    else
+      read -r -s -p 'Confirm Vault password: ' vpw2; printf '\n'
+      [[ $vpw == "$vpw2" ]] || die 'Vault passwords do not match.'
+    fi
+    install -d -m 700 "$(dirname -- "$VAULT_PASSWORD_FILE")"
+    printf '%s\n' "$vpw" > "$VAULT_PASSWORD_FILE"; chmod 600 "$VAULT_PASSWORD_FILE"
+    vault_file=$VAULT_PASSWORD_FILE
+  else
+    store_vault_pw=false
+    until bm_read_secret_confirmed 'Vault password (you will need it for --ask-vault-pass)'; do :; done
+    vpw=$BM_SECRET; BM_SECRET=''
+    vault_file=$BM_TMP/vault-pass; printf '%s\n' "$vpw" > "$vault_file"
+  fi
+  unset vpw vpw2
+fi
 
+# ---------------------------------------------------------- output inventory ---
+install -d -m 700 "$OUTPUT_DIR" || die "Cannot create $OUTPUT_DIR"
+OUTPUT_DIR=$(cd -- "$OUTPUT_DIR" && pwd)
+INVENTORY=$OUTPUT_DIR/hosts.ini
+if [[ -e $INVENTORY ]]; then
+  printf 'Updating existing inventory: %s\n' "$INVENTORY"
+else
+  printf '# Generated by ansible-inventory-generator. Secrets live in host_vars/*/vault.yml.\n' > "$INVENTORY"
+  if ask_yes_no 'Import an existing INI inventory as the starting point?' n; then
+    read -r -p 'Source inventory path [/etc/ansible/hosts]: ' src || exit 0
+    src=${src:-/etc/ansible/hosts}
+    [[ -r $src ]] || die "Cannot read $src"
+    cp -- "$src" "$INVENTORY" && chmod 600 "$INVENTORY"
+  fi
+fi
+if ! python3 "$HELPER" plaintext-secrets "$INVENTORY" >/dev/null; then
+  printf 'The inventory contains plaintext passwords for: %s\n' "$(python3 "$HELPER" plaintext-secrets "$INVENTORY" | paste -sd' ')"
+  if ask_yes_no 'Move them into Ansible Vault (host_vars/<host>/vault.yml) now?' y; then
+    migrated=$(python3 "$HELPER" migrate "$INVENTORY" "$vault_file") || die 'Migration failed.'
+    printf 'Moved into Vault: %s\n' "$(paste -sd' ' <<< "$migrated")"
+  fi
+fi
+
+# ----------------------------------------------------------- Ansible account ---
+read -r -p 'Name of the dedicated Ansible account [ansible]: ' account_user || exit 0
+account_user=${account_user:-ansible}
+bm_valid_unix_user "$account_user" || die "Invalid account name '$account_user' (lowercase letters, digits, _ and -)."
+until bm_read_secret_confirmed "Password for '$account_user' (sudo/runas; stored only in Ansible Vault)"; do :; done
+account_password=$BM_SECRET; BM_SECRET=''
+[[ $account_password != *$'\n'* ]] || die 'Passwords must not contain line breaks.'
+sudo_mode=vault
+if ask_yes_no "Linux: use passwordless sudo (NOPASSWD) for '$account_user' instead of the Vault-protected password?" n; then sudo_mode=nopasswd; fi
+
+# ------------------------------------------------------------------- scan ---
 while true; do
   read -r -p 'First IPv4 address: ' first || exit 0
   read -r -p 'Last IPv4 address:  ' last || exit 0
-  first_n=$(ipv4_to_int "$first") || { printf 'Invalid first IPv4 address.\n'; continue; }
-  last_n=$(ipv4_to_int "$last") || { printf 'Invalid last IPv4 address.\n'; continue; }
-  ((first_n<=last_n)) || { printf 'The first address must not be greater than the last address.\n'; continue; }
-  ((last_n-first_n<=65535)) || { printf 'Ranges are limited to 65,536 addresses.\n'; continue; }
-  ask_yes_no "Scan ${first} through ${last}?" y && break
+  first_n=$(bm_ipv4_to_int "$first") || { printf 'Invalid first IPv4 address.\n'; continue; }
+  last_n=$(bm_ipv4_to_int "$last") || { printf 'Invalid last IPv4 address.\n'; continue; }
+  ((first_n <= last_n)) || { printf 'The first address must not be greater than the last address.\n'; continue; }
+  ((last_n - first_n <= 65535)) || { printf 'Ranges are limited to 65,536 addresses.\n'; continue; }
+  read -r -p 'SSH port(s), comma-separated [22]: ' port_input || exit 0
+  IFS=', ' read -ra ports <<< "${port_input:-22}"
+  ok=true; for p in "${ports[@]}"; do bm_valid_port "$p" || ok=false; done
+  [[ $ok == true && ${#ports[@]} -gt 0 ]] || { printf 'Invalid port list (1-65535, comma-separated).\n'; continue; }
+  ask_yes_no "Scan $first through $last?" y && break
 done
+printf '\nScanning %s through %s on port(s) %s...\n' "$first" "$last" "${ports[*]}"
+bm_scan "$first" "$last" "${ports[@]}"
+((${#BM_SCAN_RESULTS[@]})) || { printf 'No open SSH ports found. The inventory is unchanged.\n'; exit 0; }
 
-while true; do
-  read -r -p 'SSH port(s), comma-separated, 1-65535 [22]: ' port_input || exit 0
-  port_input=${port_input:-22}
-  if [[ ! $port_input =~ ^[0-9,[:space:]]+$ ]]; then printf 'Enter only port numbers separated by commas.\n'; continue; fi
-  IFS=, read -ra raw_ports <<< "$port_input"
-  declare -a ports=()
-  bad=false
-  for raw_port in "${raw_ports[@]}"; do
-    raw_port=${raw_port//[[:space:]]/}
-    if [[ ! $raw_port =~ ^[0-9]+$ || ${#raw_port} -gt 5 ]] || ((10#$raw_port<1 || 10#$raw_port>65535)); then bad=true; break; fi
-    found=false; for p in "${ports[@]}"; do [[ $p == "$((10#$raw_port))" ]] && found=true; done
-    [[ $found == true ]] || ports+=("$((10#$raw_port))")
-  done
-  if [[ $bad == true || ${#ports[@]} -eq 0 ]]; then printf 'Invalid port list. Valid ports are 1 through 65535, separated by commas. Try again.\n'; continue; fi
-  break
-done
-
-printf '\nScanning %s through %s on port(s): %s\n' "$first" "$last" "$(IFS=,; echo "${ports[*]}")"
-declare -a candidates=()
-for ((n=first_n; n<=last_n; n++)); do
-  ip=$(int_to_ipv4 "$n")
-  open_ports=()
-  scan_ports=("${ports[@]}")
-  saved_port=$(python3 "$HELPER" lookup-port "$OUTPUT_FILE" "$ip")
-  if [[ $saved_port =~ ^[0-9]+$ ]] && ((saved_port>=1 && saved_port<=65535)); then
-    already_listed=false; for p in "${scan_ports[@]}"; do [[ $p == "$saved_port" ]] && already_listed=true; done
-    [[ $already_listed == true ]] || scan_ports+=("$saved_port")
-  fi
-  for port in "${scan_ports[@]}"; do
-    if timeout 1 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$ip" "$port" 2>/dev/null; then open_ports+=("$port"); fi
-  done
-  if ((${#open_ports[@]}>0)); then candidates+=("$ip|$(IFS=,; echo "${open_ports[*]}")"); printf 'Open candidate: %s (port(s): %s)\n' "$ip" "${open_ports[*]}"; fi
-done
-if ((${#candidates[@]}==0)); then printf 'No open selected ports found. The starting inventory is unchanged.\n'; exit 0; fi
-
-get_existing() {
-  local encoded alias user password port group
-  encoded=$(python3 "$HELPER" lookup "$OUTPUT_FILE" "$1")
-  [[ -n $encoded ]] || return 1
-  IFS='|' read -r alias_b64 user_b64 pass_b64 port_b64 group_b64 <<< "$encoded"
-  EXIST_ALIAS=$(decode_b64 "$alias_b64"); EXIST_USER=$(decode_b64 "$user_b64"); EXIST_PASS=$(decode_b64 "$pass_b64")
-  EXIST_PORT=$(decode_b64 "$port_b64"); EXIST_GROUP=$(decode_b64 "$group_b64")
-  [[ -n $EXIST_USER && -n $EXIST_PASS && $EXIST_PORT =~ ^[0-9]+$ ]]
-}
-try_login() {
-  local ip=$1 port=$2 user=$3 password=$4 attempt facts
-  for ((attempt=1; attempt<=3; attempt++)); do
-    printf 'SSH attempt %d/3: %s:%s\n' "$attempt" "$ip" "$port"
-    facts=$(SSHPASS="$password" timeout 30 sshpass -e ssh -T -F /dev/null -p "$port" \
-      -o ConnectTimeout="$CONNECT_TIMEOUT" -o ConnectionAttempts=1 -o NumberOfPasswordPrompts=1 \
-      -o PreferredAuthentications=password,keyboard-interactive -o StrictHostKeyChecking=accept-new \
-      "$user@$ip" "printf 'INVHOST='; hostname; printf '\\nINVPY='; command -v python3 || command -v python" 2>&1 || true)
-    if [[ $facts == *INVHOST=* && $facts == *INVPY=* ]]; then LOGIN_FACTS=$facts; return 0; fi
-  done
-  return 1
-}
-choose_group() {
-  local existing_group=$1 groups_output choice
+# ------------------------------------------------------------ per-host work ---
+choose_group() { # existing_group
+  local existing=$1 choice g
   SELECTED_GROUP=
-  if [[ -n $existing_group ]]; then
-    if ask_yes_no "Keep existing group [$existing_group]?" y; then SELECTED_GROUP=$existing_group; return 0; fi
-  fi
-  groups_output=$(python3 "$HELPER" groups "$OUTPUT_FILE")
-  mapfile -t groups <<< "$groups_output"
-  if ((${#groups[@]>0})) && ask_yes_no 'Add this host to an existing group?' y; then
-    printf '\nAvailable groups:\n'
-    for i in "${!groups[@]}"; do printf '  %d) %s\n' "$((i+1))" "${groups[$i]}"; done
-    read -r -p 'Choose a group number or enter its name: ' choice
-    if [[ $choice =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#groups[@]})); then SELECTED_GROUP=${groups[$((choice-1))]}
+  if [[ -n $existing ]] && ask_yes_no "Keep existing group [$existing]?" y; then SELECTED_GROUP=$existing; return 0; fi
+  mapfile -t groups < <(python3 "$HELPER" groups "$INVENTORY")
+  if ((${#groups[@]} > 0)) && ask_yes_no 'Add this host to an existing group?' y; then
+    printf 'Available groups:\n'
+    for i in "${!groups[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${groups[$i]}"; done
+    read -r -p 'Choose a group number or name: ' choice
+    if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#groups[@]})); then SELECTED_GROUP=${groups[$((choice - 1))]}
     else for g in "${groups[@]}"; do [[ $g == "$choice" ]] && SELECTED_GROUP=$g; done; fi
-    [[ -n $SELECTED_GROUP ]] || { printf 'No matching group.\n'; return 1; }
-    return 0
+    [[ -n $SELECTED_GROUP ]] && return 0
+    printf 'No matching group.\n'
   fi
   if ask_yes_no 'Add this host to a new group?' n; then
     read -r -p 'New group name: ' SELECTED_GROUP
-    valid_group "$SELECTED_GROUP" || { printf 'Invalid group name.\n'; return 1; }
+    valid_group "$SELECTED_GROUP" || { printf 'Invalid group name (letters, digits, _; no leading digit). Host stays ungrouped.\n'; SELECTED_GROUP=; }
   fi
-}
-save_host() {
-  INV_ALIAS=$1 INV_IP=$2 INV_USER=$3 INV_PASSWORD=$4 INV_PORT=$5 INV_PYTHON=$6 INV_GROUP=$7 \
-    python3 - "$OUTPUT_FILE" <<'PY'
-import json, os, sys
-payload = {key: os.environ[name] for key, name in {
-    "alias":"INV_ALIAS", "ip":"INV_IP", "user":"INV_USER", "password":"INV_PASSWORD",
-    "port":"INV_PORT", "python":"INV_PYTHON", "group":"INV_GROUP"}.items()}
-json.dump(payload, sys.stdout)
-PY
-}
-save_host_to_inventory() {
-  local payload
-  payload=$(save_host "$@") || return 1
-  printf '%s' "$payload" | python3 "$HELPER" update "$OUTPUT_FILE"
+  return 0
 }
 
-for candidate in "${candidates[@]}"; do
+# Tries key login as $1 on the given ports; sets connected_port. Handles changed host keys.
+try_key_login() { # user port...
+  local user=$1 port rc; shift
+  for port in "$@"; do
+    bm_gather_facts "$ip" "$port" "$user"; rc=$?
+    if ((rc == 3)) && bm_fix_hostkey "$ip" "$port"; then bm_gather_facts "$ip" "$port" "$user"; rc=$?; fi
+    ((rc == 0)) && { connected_port=$port; return 0; }
+  done
+  return 1
+}
+
+windows_password_ok() { # port user password
+  local ps out
+  ps="Add-Type -AssemblyName System.DirectoryServices.AccountManagement; \$c = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Machine'); \$u = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(bm_b64 "$2")')); \$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(bm_b64 "$3")')); [Console]::WriteLine('BMVALID=' + \$c.ValidateCredentials(\$u, \$p))"
+  out=$(bm_key_exec "$ip" "$1" "$2" "powershell.exe -NoProfile -NonInteractive -EncodedCommand $(bm_ps_encode "$ps")" 2>&1)
+  [[ $out == *BMVALID=True* ]]
+}
+
+declare -a saved_aliases=() saved_families=() failed=()
+last_admin=
+for candidate in "${BM_SCAN_RESULTS[@]}"; do
   ip=${candidate%%|*}; IFS=, read -ra open_ports <<< "${candidate#*|}"
-  printf '\nHost: %s\n' "$ip"
-  connected=false; username= password= connected_port= old_group=
-  if get_existing "$ip"; then
-    old_group=$EXIST_GROUP
-    if ask_yes_no "This address exists as [$EXIST_ALIAS]. Try its saved username, password, and port $EXIST_PORT?" y; then
-      if try_login "$ip" "$EXIST_PORT" "$EXIST_USER" "$EXIST_PASS"; then
-        connected=true; username=$EXIST_USER; password=$EXIST_PASS; connected_port=$EXIST_PORT
-      else printf 'Saved connection details failed. Falling back to the entered port scan.\n'; fi
-    fi
+  printf '\n=== Host %s (open: %s) ===\n' "$ip" "${open_ports[*]}"
+  old_alias='' old_user='' old_port='' old_group=''
+  if encoded=$(python3 "$HELPER" lookup "$INVENTORY" "$ip") && [[ -n $encoded ]]; then
+    IFS='|' read -r a u p g <<< "$encoded"
+    old_alias=$(decode_b64 "$a") old_user=$(decode_b64 "$u") old_port=$(decode_b64 "$p") old_group=$(decode_b64 "$g")
+    printf 'Known as [%s] (user %s, port %s).\n' "$old_alias" "${old_user:-?}" "$old_port"
   fi
-  if [[ $connected != true ]]; then
-    ask_yes_no 'Try to connect to this host and add/update its inventory entry?' y || { printf 'Skipped %s.\n' "$ip"; continue; }
-    read -r -p 'SSH username: ' username
-    valid_user "$username" || { printf 'Invalid username; skipped.\n'; continue; }
-    read -r -s -p 'SSH password: ' password; printf '\n'
-    [[ -n $password ]] || { printf 'Password cannot be empty; skipped.\n'; continue; }
-    for port in "${open_ports[@]}"; do
-      if try_login "$ip" "$port" "$username" "$password"; then connected=true; connected_port=$port; break; fi
-      printf 'SSH authentication failed on port %s.\n' "$port"
+  ask_yes_no 'Add/update this host?' y || { printf 'Skipped.\n'; continue; }
+  user=$account_user
+  if [[ -n $old_user && $old_user != "$account_user" ]] && ask_yes_no "Keep the existing inventory user '$old_user' instead of '$account_user'?" n; then user=$old_user; fi
+  try_ports=("${open_ports[@]}")
+  [[ -n $old_port ]] && try_ports=("$old_port" "${open_ports[@]/$old_port}")
+  read -ra try_ports <<< "${try_ports[*]}"
+  connected_port=
+  if try_key_login "$user" "${try_ports[@]}"; then
+    printf 'Key login as %s works.\n' "$user"
+  else
+    printf 'Key-based login as %s@%s is not possible yet.\n' "$user" "$ip"
+    if [[ $user != "$account_user" ]]; then printf 'Bootstrapping is only done for %s; skipped.\n' "$account_user"; failed+=("$ip"); continue; fi
+    ask_yes_no "Bootstrap $ip now (create '$account_user', install SSH key, configure sudo/Administrators)?" y || { failed+=("$ip"); continue; }
+    rc=1
+    for _ in 1 2 3; do
+      read -r -p "Administrator SSH login${last_admin:+ [$last_admin]}: " admin_user || exit 0
+      admin_user=${admin_user:-$last_admin}
+      [[ -n $admin_user ]] || continue
+      read -r -s -p "Password for $admin_user@$ip (empty = SSH key/agent): " admin_password; printf '\n'
+      last_admin=$admin_user
+      bm_bootstrap_host "$ip" "${try_ports[0]}" "$admin_user" "$admin_password" "$account_user" "$account_password" "$sudo_mode"; rc=$?
+      admin_password=
+      ((rc == 2)) || break
     done
+    if ((rc != 0)) || ! try_key_login "$account_user" "${try_ports[0]}"; then printf 'Could not onboard %s.\n' "$ip"; failed+=("$ip"); continue; fi
   fi
-  if [[ $connected != true ]]; then printf 'No SSH login succeeded for %s; leaving the inventory entry unchanged.\n' "$ip"; unset password; continue; fi
+  family=$BM_FACT_FAMILY hostname=$BM_FACT_HOST python=$BM_FACT_PYTHON
+  printf 'Connected: %s (%s), port %s%s\n' "$hostname" "${BM_FACT_OS:-$family}" "$connected_port" "${python:+, $python}"
+  if [[ $family == linux && -z $python ]]; then printf 'No Python interpreter on %s; Ansible modules need python3 (bootstrap installs it).\n' "$ip"; fi
 
-  facts=$(printf '%s\n' "$LOGIN_FACTS" | tr -d '\r')
-  hostname=$(printf '%s\n' "$facts" | sed -n 's/^.*INVHOST=//p' | head -n1 | xargs)
-  python_path=$(printf '%s\n' "$facts" | sed -n 's/^.*INVPY=//p' | head -n1 | xargs)
-  if [[ -z $hostname || -z $python_path || $hostname =~ [[:space:]] || $hostname =~ [\[\]\#] || $python_path =~ [[:space:]] ]]; then
-    printf 'Could not obtain a safe hostname and Python path; leaving the inventory entry unchanged.\n'; unset password; continue
-  fi
-  printf 'SSH succeeded. Hostname: %s; Python interpreter: %s; SSH port: %s\n' "$hostname" "$python_path" "$connected_port"
-  if ! choose_group "$old_group"; then unset password; continue; fi
-  if save_host_to_inventory "$hostname" "$ip" "$username" "$password" "$connected_port" "$python_path" "$SELECTED_GROUP"; then
-    printf 'Updated %s in %s.\n' "$ip" "$OUTPUT_FILE"
-  else printf 'Could not update %s; check inventory file permissions and format.\n' "$ip"; fi
-  unset password
+  # Determine and verify the password used for privilege escalation.
+  become_password=$account_password verified=false
+  for _ in 1 2 3; do
+    if [[ $family == linux ]]; then bm_verify_become "$ip" "$connected_port" "$user" "$become_password" && verified=true
+    else windows_password_ok "$connected_port" "$user" "$become_password" && verified=true; fi
+    [[ $verified == true ]] && break
+    printf 'The password for %s on %s was not accepted.\n' "$user" "$ip"
+    read -r -s -p "Password of $user on $ip (empty = keep the entered one unverified): " pw; printf '\n'
+    [[ -z $pw ]] && break
+    become_password=$pw; pw=''
+  done
+  [[ $verified == true ]] && printf 'Privilege escalation verified.\n' || printf 'Warning: privilege escalation could not be verified for %s.\n' "$ip"
+
+  alias=$(python3 "$HELPER" alias "$INVENTORY" "$ip" "${old_alias:-$hostname}")
+  choose_group "$old_group"
+  python3 - "$alias" "$ip" "$user" "$connected_port" "$python" "$SELECTED_GROUP" <<'PY' | python3 "$HELPER" update "$INVENTORY" || { printf 'Could not update the inventory.\n'; failed+=("$ip"); continue; }
+import json, sys
+a = sys.argv[1:]
+json.dump({"alias": a[0], "ip": a[1], "user": a[2], "port": a[3], "python": a[4], "group": a[5]}, sys.stdout)
+PY
+  BECOME=$become_password python3 -c 'import json,os,sys; json.dump({"alias":sys.argv[1],"family":sys.argv[2],"user":sys.argv[3],"become_password":os.environ["BECOME"]},sys.stdout)' \
+    "$alias" "$family" "$user" | python3 "$HELPER" hostvars "$INVENTORY" "$vault_file" || { printf 'Could not write the Vault for %s.\n' "$alias"; failed+=("$ip"); continue; }
+  become_password=
+  printf 'Saved [%s] -> %s, host_vars/%s/{vars.yml,vault.yml}\n' "$alias" "$INVENTORY" "$alias"
+  saved_aliases+=("$alias"); saved_families+=("$family")
 done
+account_password=
 
-chmod 600 "$OUTPUT_FILE" 2>/dev/null || true
-printf '\nFinished. Inventory output: %s\n' "$OUTPUT_FILE"
-printf 'The input inventory was not modified. Protect the output: it contains plaintext passwords.\n'
+# -------------------------------------------------------------- ansible.cfg ---
+cfg=$OUTPUT_DIR/ansible.cfg
+if [[ ! -e $cfg ]] || grep -q '^# Generated by ansible-inventory-generator' "$cfg"; then
+  {
+    printf '# Generated by ansible-inventory-generator\n[defaults]\ninventory = hosts.ini\n'
+    printf 'private_key_file = %s\n' "$BM_KEY"
+    [[ $store_vault_pw == true ]] && printf 'vault_password_file = %s\n' "$vault_file"
+    printf 'host_key_checking = True\ninterpreter_python = auto_silent\n\n[ssh_connection]\n'
+    printf 'ssh_args = -C -o ControlMaster=auto -o ControlPersist=60s -o StrictHostKeyChecking=accept-new\n'
+  } > "$cfg"
+  chmod 600 "$cfg"
+fi
+
+if python3 "$HELPER" plaintext-secrets "$INVENTORY" >/dev/null; then
+  printf '\nNo plaintext passwords in %s.\n' "$INVENTORY"
+else
+  printf '\nWarning: plaintext passwords remain for: %s\n' "$(python3 "$HELPER" plaintext-secrets "$INVENTORY" | paste -sd' ')"
+fi
+
+# ------------------------------------------------------------- verification ---
+if ((${#saved_aliases[@]})) && command -v ansible >/dev/null 2>&1 && ask_yes_no 'Verify the saved hosts with Ansible now (become via Vault)?' y; then
+  extra=(); [[ $store_vault_pw == true ]] || extra=(--vault-password-file "$vault_file")
+  for i in "${!saved_aliases[@]}"; do
+    a=${saved_aliases[$i]}
+    if [[ ${saved_families[$i]} == windows ]]; then
+      out=$(cd "$OUTPUT_DIR" && ANSIBLE_CONFIG=$cfg ansible "$a" "${extra[@]}" -m ansible.builtin.raw -a 'whoami' 2>&1)
+    else
+      out=$(cd "$OUTPUT_DIR" && ANSIBLE_CONFIG=$cfg ansible "$a" "${extra[@]}" -b -m ansible.builtin.command -a 'id -u' 2>&1)
+    fi
+    if [[ $? -eq 0 ]]; then
+      printf '  OK   %s: %s\n' "$a" "$(tail -n1 <<< "$out" | tr -d '\r')"
+    else
+      printf '  FAIL %s\n' "$a"; tail -n 5 <<< "$out" | sed 's/^/       /'
+    fi
+  done
+fi
+
+printf '\nFinished. Inventory: %s\n' "$INVENTORY"
+((${#failed[@]})) && printf 'Not onboarded: %s\n' "${failed[*]}"
+printf 'Use it with:  cd %q && ansible all -m ping%s\n' "$OUTPUT_DIR" "$([[ $store_vault_pw == true ]] || printf ' --ask-vault-pass')"
+printf '          or: ANSIBLE_CONFIG=%q ansible-playbook site.yml\n' "$cfg"
